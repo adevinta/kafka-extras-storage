@@ -35,6 +35,8 @@ import org.apache.kafka.metadata.MetadataRecordSerde
 import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
+import scala.util.control.Breaks
+import java.nio.ByteBuffer
 
 object DumpLogSegments {
 
@@ -58,8 +60,13 @@ object DumpLogSegments {
       val suffix = filename.substring(filename.lastIndexOf("."))
       suffix match {
         case Log.LogFileSuffix =>
-          dumpLog(file, opts.shouldPrintDataLog, nonConsecutivePairsForLogFilesMap, opts.isDeepIteration,
-            opts.maxMessageSize, opts.messageParser, opts.skipRecordMetadata)
+          if (opts.compressRecords != 0) {
+             compressRecords(file, opts.maxBytes, opts.compressRecords)
+          }
+          else {
+            dumpLog(file, opts.shouldPrintDataLog, nonConsecutivePairsForLogFilesMap, opts.isDeepIteration,
+              opts.maxMessageSize, opts.messageParser, opts.skipRecordMetadata, opts.maxBytes)
+          }
         case Log.IndexFileSuffix =>
           dumpIndex(file, opts.indexSanityOnly, opts.verifyOnly, misMatchesForIndexFilesMap, opts.maxMessageSize)
         case Log.TimeIndexFileSuffix =>
@@ -240,6 +247,34 @@ object DumpLogSegments {
     }
   }
 
+  private def compressRecords(file: File,
+                      maxBytes: Int,
+                      records: Int): Unit = {
+    val buffer = ByteBuffer.allocate(maxBytes)
+    var recordsCount = 0L
+    val builder = MemoryRecords.builder(buffer, RecordBatch.MAGIC_VALUE_V2, CompressionType.LZ4, TimestampType.CREATE_TIME, 0L)
+    val fileRecords = FileRecords.open(file, false).slice(0, maxBytes)
+    try {
+      val loop = new Breaks
+      loop.breakable {
+        for (batch <- fileRecords.batches.asScala) {
+          if (!batch.isControlBatch) {
+            for (record <- batch.asScala) {
+              if (recordsCount >= records) loop.break()
+              builder.appendWithOffset(recordsCount, System.currentTimeMillis(), null, Utils.readBytes(record.value))
+              recordsCount += 1
+              if (recordsCount >= records) loop.break()
+            }
+          }
+        }
+      }
+      println("AVG current record size: " + builder.uncompressedBytesWritten() / recordsCount)
+      val memoryRecords = builder.build()
+      val batchSize = memoryRecords.firstBatchSize()
+      println("AVG simulated record size: " + batchSize / recordsCount)
+    } finally fileRecords.closeHandlers()
+  }
+
   /* print out the contents of the log */
   private def dumpLog(file: File,
                       printContents: Boolean,
@@ -247,14 +282,15 @@ object DumpLogSegments {
                       isDeepIteration: Boolean,
                       maxMessageSize: Int,
                       parser: MessageParser[_, _],
-                      skipRecordMetadata: Boolean): Unit = {
+                      skipRecordMetadata: Boolean,
+                      maxBytes: Int): Unit = {
     val startOffset = file.getName.split("\\.")(0).toLong
+
     println("Starting offset: " + startOffset)
-    val fileRecords = FileRecords.open(file, false)
+    val fileRecords = FileRecords.open(file, false).slice(0, maxBytes)
     try {
       var validBytes = 0L
       var lastOffset = -1L
-
       for (batch <- fileRecords.batches.asScala) {
         printBatchLevel(batch, validBytes)
         if (isDeepIteration) {
@@ -307,10 +343,13 @@ object DumpLogSegments {
         validBytes += batch.sizeInBytes
       }
       val trailingBytes = fileRecords.sizeInBytes - validBytes
-      if (trailingBytes > 0)
+      if ( (trailingBytes > 0) && (maxBytes == Integer.MAX_VALUE) ){
         println(s"Found $trailingBytes invalid bytes at the end of ${file.getName}")
+
+      }
     } finally fileRecords.closeHandlers()
   }
+
 
   private def printBatchLevel(batch: FileLogInputStream.FileChannelRecordBatch, accumulativeBytes: Long): Unit = {
     if (batch.magic >= RecordBatch.MAGIC_VALUE_V2)
@@ -431,6 +470,16 @@ object DumpLogSegments {
       .describedAs("size")
       .ofType(classOf[java.lang.Integer])
       .defaultsTo(5 * 1024 * 1024)
+    val compressRecordsOpt = parser.accepts("simulate-records-compression", "number of records to simulate the compression.")
+      .withOptionalArg()
+      .ofType(classOf[java.lang.Integer])
+      .defaultsTo(0)
+
+    val maxBytesOpt = parser.accepts("max-bytes", "Limit the amount of total batches read in bytes avoiding reading the whole .log file(s).")
+       .withRequiredArg
+       .describedAs("size")
+       .ofType(classOf[java.lang.Integer])
+       .defaultsTo(Integer.MAX_VALUE)
     val deepIterationOpt = parser.accepts("deep-iteration", "if set, uses deep instead of shallow iteration. Automatically set if print-data-log is enabled.")
     val valueDecoderOpt = parser.accepts("value-decoder-class", "if set, used to deserialize the messages. This class should implement kafka.serializer.Decoder trait. Custom jar should be available in kafka/libs directory.")
       .withOptionalArg()
@@ -474,6 +523,8 @@ object DumpLogSegments {
     lazy val indexSanityOnly: Boolean = options.has(indexSanityOpt)
     lazy val files = options.valueOf(filesOpt).split(",")
     lazy val maxMessageSize = options.valueOf(maxMessageSizeOpt).intValue()
+    lazy val compressRecords = options.valueOf(compressRecordsOpt).intValue()
+    lazy val maxBytes = options.valueOf(maxBytesOpt).intValue()
 
     def checkArgs(): Unit = CommandLineUtils.checkRequiredArgs(parser, options, filesOpt)
 
